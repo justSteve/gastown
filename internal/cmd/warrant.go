@@ -3,6 +3,7 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,6 +20,7 @@ var (
 	warrantReason  string
 	warrantListAll bool
 	warrantForce   bool
+	warrantStdin   bool // Read reason from stdin
 )
 
 // Warrant represents a death warrant for an agent
@@ -100,8 +102,8 @@ Examples:
 
 func init() {
 	// File flags
-	warrantFileCmd.Flags().StringVarP(&warrantReason, "reason", "r", "", "Reason for the warrant (required)")
-	_ = warrantFileCmd.MarkFlagRequired("reason")
+	warrantFileCmd.Flags().StringVarP(&warrantReason, "reason", "r", "", "Reason for the warrant (required unless --stdin)")
+	warrantFileCmd.Flags().BoolVar(&warrantStdin, "stdin", false, "Read reason from stdin (avoids shell quoting issues)")
 
 	// List flags
 	warrantListCmd.Flags().BoolVarP(&warrantListAll, "all", "a", false, "Include executed warrants")
@@ -133,6 +135,23 @@ func warrantFilePath(dir, target string) string {
 }
 
 func runWarrantFile(cmd *cobra.Command, args []string) error {
+	// Handle --stdin: read reason from stdin (avoids shell quoting issues)
+	if warrantStdin {
+		if warrantReason != "" {
+			return fmt.Errorf("cannot use --stdin with --reason/-r")
+		}
+		data, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return fmt.Errorf("reading stdin: %w", err)
+		}
+		warrantReason = strings.TrimRight(string(data), "\n")
+	}
+
+	// Require reason via --reason or --stdin
+	if warrantReason == "" {
+		return fmt.Errorf("required flag \"reason\" not set (use --reason/-r or --stdin)")
+	}
+
 	target := args[0]
 
 	warrantDir, err := getWarrantDir()
@@ -327,16 +346,8 @@ func targetToSessionName(target string) (string, error) {
 		// This shouldn't happen - need dog name
 		return "", fmt.Errorf("invalid target: need dog name (e.g., deacon/dogs/alpha)")
 	case len(parts) == 3 && parts[0] == "deacon" && parts[1] == "dogs":
-		// deacon/dogs/alpha -> gt-dog-alpha (or gt-<town>-deacon-alpha)
-		townRoot, err := workspace.FindFromCwd()
-		if err != nil {
-			return fmt.Sprintf("gt-dog-%s", parts[2]), nil
-		}
-		townName, err := workspace.GetTownName(townRoot)
-		if err != nil {
-			return fmt.Sprintf("gt-dog-%s", parts[2]), nil
-		}
-		return fmt.Sprintf("gt-%s-deacon-%s", townName, parts[2]), nil
+		// deacon/dogs/alpha -> hq-dog-alpha
+		return fmt.Sprintf("hq-dog-%s", parts[2]), nil
 	default:
 		// Fallback: just use the target with dashes
 		return "gt-" + strings.ReplaceAll(target, "/", "-"), nil

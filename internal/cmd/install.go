@@ -16,7 +16,9 @@ import (
 	"github.com/steveyegge/gastown/internal/runtime"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/deps"
+	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/formula"
+	"github.com/steveyegge/gastown/internal/hooks"
 	"github.com/steveyegge/gastown/internal/shell"
 	"github.com/steveyegge/gastown/internal/state"
 	"github.com/steveyegge/gastown/internal/style"
@@ -26,16 +28,17 @@ import (
 )
 
 var (
-	installForce      bool
-	installName       string
-	installOwner      string
-	installPublicName string
-	installNoBeads    bool
-	installGit        bool
-	installGitHub     string
-	installPublic     bool
-	installShell      bool
-	installWrappers   bool
+	installForce        bool
+	installName         string
+	installOwner        string
+	installPublicName   string
+	installNoBeads      bool
+	installGit          bool
+	installGitHub       string
+	installPublic       bool
+	installShell        bool
+	installWrappers     bool
+	installSupervisor   bool
 )
 
 var installCmd = &cobra.Command{
@@ -62,7 +65,8 @@ Examples:
   gt install ~/gt --git                        # Also init git with .gitignore
   gt install ~/gt --github=user/repo           # Create private GitHub repo (default)
   gt install ~/gt --github=user/repo --public  # Create public GitHub repo
-  gt install ~/gt --shell                      # Install shell integration (sets GT_TOWN_ROOT/GT_RIG)`,
+  gt install ~/gt --shell                      # Install shell integration (sets GT_TOWN_ROOT/GT_RIG)
+  gt install ~/gt --supervisor                 # Configure launchd/systemd for daemon auto-restart`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: runInstall,
 }
@@ -78,6 +82,7 @@ func init() {
 	installCmd.Flags().BoolVar(&installPublic, "public", false, "Make GitHub repo public (use with --github)")
 	installCmd.Flags().BoolVar(&installShell, "shell", false, "Install shell integration (sets GT_TOWN_ROOT/GT_RIG env vars)")
 	installCmd.Flags().BoolVar(&installWrappers, "wrappers", false, "Install gt-codex/gt-opencode wrapper scripts to ~/bin/")
+	installCmd.Flags().BoolVar(&installSupervisor, "supervisor", false, "Configure launchd/systemd for daemon auto-restart")
 	rootCmd.AddCommand(installCmd)
 }
 
@@ -137,6 +142,16 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Preflight: ensure dolt identity before any workspace mutations.
+	// This prevents a partial install that can't be retried without --force.
+	if !installNoBeads {
+		if _, err := exec.LookPath("dolt"); err == nil {
+			if err := doltserver.EnsureDoltIdentity(); err != nil {
+				return fmt.Errorf("dolt identity setup failed (required for beads): %w\n\nTo fix, run:\n  dolt config --global --add user.name \"Your Name\"\n  dolt config --global --add user.email \"you@example.com\"", err)
+			}
+		}
+	}
+
 	fmt.Printf("%s Creating Gas Town HQ at %s\n\n",
 		style.Bold.Render("🏭"), style.Dim.Render(absPath))
 
@@ -193,17 +208,6 @@ func runInstall(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Printf("   ✓ Created mayor/rigs.json\n")
 
-	// Create Mayor CLAUDE.md at mayor/ (Mayor's canonical home)
-	// NOTE: Role-specific CLAUDE.md stays in mayor/, but a generic identity anchor
-	// is also created at the town root (see createTownRootCLAUDEmd below).
-	if created, err := createMayorCLAUDEmd(mayorDir, absPath); err != nil {
-		fmt.Printf("   %s Could not create CLAUDE.md: %v\n", style.Dim.Render("⚠"), err)
-	} else if created {
-		fmt.Printf("   ✓ Created mayor/CLAUDE.md\n")
-	} else {
-		fmt.Printf("   ✓ Preserved existing mayor/CLAUDE.md\n")
-	}
-
 	// Create a generic CLAUDE.md at the town root as an identity anchor.
 	// Claude Code sets its CWD to the git root (~/gt/), so mayor/CLAUDE.md is
 	// not loaded directly. This town-root file ensures agents running from within
@@ -227,7 +231,7 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		fmt.Printf("   %s Could not create mayor directory: %v\n", style.Dim.Render("⚠"), err)
 	} else {
 		mayorRuntimeConfig := config.ResolveRoleAgentConfig("mayor", absPath, mayorDir)
-		if err := runtime.EnsureSettingsForRole(mayorDir, "mayor", mayorRuntimeConfig); err != nil {
+		if err := runtime.EnsureSettingsForRole(mayorDir, mayorDir, "mayor", mayorRuntimeConfig); err != nil {
 			fmt.Printf("   %s Could not create mayor settings: %v\n", style.Dim.Render("⚠"), err)
 		} else {
 			fmt.Printf("   ✓ Created mayor/.claude/settings.json\n")
@@ -240,7 +244,7 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		fmt.Printf("   %s Could not create deacon directory: %v\n", style.Dim.Render("⚠"), err)
 	} else {
 		deaconRuntimeConfig := config.ResolveRoleAgentConfig("deacon", absPath, deaconDir)
-		if err := runtime.EnsureSettingsForRole(deaconDir, "deacon", deaconRuntimeConfig); err != nil {
+		if err := runtime.EnsureSettingsForRole(deaconDir, deaconDir, "deacon", deaconRuntimeConfig); err != nil {
 			fmt.Printf("   %s Could not create deacon settings: %v\n", style.Dim.Render("⚠"), err)
 		} else {
 			fmt.Printf("   ✓ Created deacon/.claude/settings.json\n")
@@ -284,6 +288,28 @@ func runInstall(cmd *cobra.Command, args []string) error {
 	// Town beads (hq- prefix) stores mayor mail, cross-rig coordination, and handoffs.
 	// Rig beads are separate and have their own prefixes.
 	if !installNoBeads {
+		// Set up Dolt: identity → init-rig hq → server start.
+		// This ordering works because InitRig falls through to `dolt init`
+		// when the server isn't running yet.
+		if _, err := exec.LookPath("dolt"); err == nil {
+			// Identity was verified in preflight above.
+			// Create HQ database before starting server.
+			if _, _, err := doltserver.InitRig(absPath, "hq"); err != nil {
+				fmt.Printf("   %s Could not init HQ database: %v\n", style.Dim.Render("⚠"), err)
+			}
+
+			// Start the Dolt server — bd commands need a running server.
+			// The server stays running after install (it's lightweight infrastructure,
+			// like a database). Stop it with 'gt dolt stop' when not needed.
+			if err := doltserver.Start(absPath); err != nil {
+				if !strings.Contains(err.Error(), "already running") {
+					fmt.Printf("   %s Could not start Dolt server: %v\n", style.Dim.Render("⚠"), err)
+				}
+			}
+		} else {
+			fmt.Printf("   %s dolt not found in PATH — Dolt backend may not fully initialize\n", style.Dim.Render("⚠"))
+		}
+
 		if err := initTownBeads(absPath); err != nil {
 			fmt.Printf("   %s Could not initialize town beads: %v\n", style.Dim.Render("⚠"), err)
 		} else {
@@ -302,6 +328,13 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		// These use hq- prefix and are stored in town beads for cross-rig coordination.
 		if err := initTownAgentBeads(absPath); err != nil {
 			fmt.Printf("   %s Could not create town-level agent beads: %v\n", style.Dim.Render("⚠"), err)
+		}
+
+		// Set beads routing mode to explicit (required by gt doctor).
+		routingCmd := exec.Command("bd", "config", "set", "routing.mode", "explicit")
+		routingCmd.Dir = absPath
+		if out, err := routingCmd.CombinedOutput(); err != nil {
+			fmt.Printf("   %s Could not set routing.mode: %s\n", style.Dim.Render("⚠"), strings.TrimSpace(string(out)))
 		}
 	}
 
@@ -334,6 +367,19 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		fmt.Printf("   ✓ Created .claude/commands/ (slash commands for all agents)\n")
 	}
 
+	// Sync hooks to generate .claude/settings.json files for all targets.
+	if targets, err := hooks.DiscoverTargets(absPath); err == nil {
+		synced := 0
+		for _, target := range targets {
+			if _, err := syncTarget(target, false); err == nil {
+				synced++
+			}
+		}
+		if synced > 0 {
+			fmt.Printf("   ✓ Synced %d hook target(s)\n", synced)
+		}
+	}
+
 	if installShell {
 		fmt.Println()
 		if err := shell.Install(); err != nil {
@@ -357,6 +403,16 @@ func runInstall(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Configure supervisor (launchd/systemd) for daemon auto-restart
+	if installSupervisor {
+		fmt.Println()
+		if msg, err := templates.ProvisionSupervisor(absPath); err != nil {
+			fmt.Printf("   %s Could not configure supervisor: %v\n", style.Dim.Render("⚠"), err)
+		} else {
+			fmt.Printf("   ✓ %s\n", msg)
+		}
+	}
+
 	fmt.Printf("\n%s HQ created successfully!\n", style.Bold.Render("✓"))
 	fmt.Println()
 	fmt.Println("Next steps:")
@@ -370,6 +426,8 @@ func runInstall(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  %d. (Optional) Configure agents: %s\n", step, style.Dim.Render("gt config agent list"))
 	step++
 	fmt.Printf("  %d. Enter the Mayor's office: %s\n", step, style.Dim.Render("gt mayor attach"))
+	fmt.Println()
+	fmt.Printf("Note: Dolt server is running (stop with %s)\n", style.Dim.Render("gt dolt stop"))
 
 	return nil
 }
@@ -405,36 +463,6 @@ Your role is set by the GT_ROLE environment variable and injected by ` + "`" + c
 	return true, os.WriteFile(claudePath, []byte(content), 0644)
 }
 
-// createMayorCLAUDEmd creates a minimal bootstrap pointer instead of full context.
-// Full context is injected ephemerally by `gt prime` at session start.
-// This keeps the on-disk file small (<30 lines) per priming architecture.
-//
-// Returns (created bool, error) - created is false if file already exists.
-func createMayorCLAUDEmd(mayorDir, _ string) (bool, error) {
-	claudePath := filepath.Join(mayorDir, "CLAUDE.md")
-
-	// Check if file already exists - preserve user customizations
-	if _, err := os.Stat(claudePath); err == nil {
-		return false, nil // File exists, preserve it
-	} else if !os.IsNotExist(err) {
-		return false, err // Unexpected error
-	}
-
-	bootstrap := `# Mayor Context
-
-> **Recovery**: Run ` + "`" + cli.Name() + " prime`" + ` after compaction, clear, or new session
-
-Full context is injected by ` + "`" + cli.Name() + " prime`" + ` at session start.
-
-## Quick Reference
-
-- Check mail: ` + "`" + cli.Name() + " mail inbox`" + `
-- Check rigs: ` + "`" + cli.Name() + " rig list`" + `
-- Start patrol: ` + "`" + cli.Name() + " patrol start`" + `
-`
-	return true, os.WriteFile(claudePath, []byte(bootstrap), 0644)
-}
-
 func writeJSON(path string, data interface{}) error {
 	content, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
@@ -445,9 +473,12 @@ func writeJSON(path string, data interface{}) error {
 
 // initTownBeads initializes town-level beads database using bd init.
 // Town beads use the "hq-" prefix for mayor mail and cross-rig coordination.
+// Uses Dolt backend in server mode (Gas Town runs a shared Dolt sql-server).
 func initTownBeads(townPath string) error {
-	// Run: bd init --prefix hq
-	cmd := exec.Command("bd", "init", "--prefix", "hq")
+	// Run: bd init --prefix hq --backend dolt --server
+	// IMPORTANT: Must pass --backend dolt to prevent SQLite database creation.
+	// Without this, bd init defaults to SQLite, which causes Classic contamination.
+	cmd := exec.Command("bd", "init", "--prefix", "hq", "--backend", "dolt", "--server")
 	cmd.Dir = townPath
 
 	output, err := cmd.CombinedOutput()
@@ -496,7 +527,6 @@ func initTownBeads(townPath string) error {
 	}
 
 	// Ensure issues.jsonl exists BEFORE creating routes.jsonl.
-	// bd init creates beads.db but not issues.jsonl in SQLite mode.
 	// If routes.jsonl is created first, bd's auto-export will write issues to routes.jsonl,
 	// corrupting it. Creating an empty issues.jsonl prevents this.
 	issuesJSONL := filepath.Join(townPath, ".beads", "issues.jsonl")

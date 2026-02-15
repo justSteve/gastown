@@ -61,7 +61,9 @@ var beadsExemptCommands = map[string]bool{
 	"install":    true,
 	"tap":        true,
 	"dnd":        true,
-	"krc":        true, // KRC doesn't require beads
+	"signal":        true, // Hook signal handlers must be fast, handle beads internally
+	"krc":           true, // KRC doesn't require beads
+	"run-migration": true, // Migration orchestrator handles its own beads checks
 }
 
 // Commands exempt from the town root branch warning.
