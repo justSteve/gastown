@@ -22,9 +22,17 @@ func TestInstallCreatesCorrectStructure(t *testing.T) {
 	// Build gt binary for testing
 	gtBinary := buildGT(t)
 
+	// HOME is overridden for isolation; configure git identity so EnsureDoltIdentity works.
+	env := append(os.Environ(), "HOME="+tmpDir)
+	configureGitIdentity(t, env)
+
+	// Kill any stale dolt from a previous test to avoid port 3307 conflict.
+	_ = exec.Command("pkill", "-f", "dolt sql-server").Run()
+	t.Cleanup(func() { _ = exec.Command("pkill", "-f", "dolt sql-server").Run() })
+
 	// Run gt install
 	cmd := exec.Command(gtBinary, "install", hqPath, "--name", "test-town")
-	cmd.Env = append(os.Environ(), "HOME="+tmpDir)
+	cmd.Env = env
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("gt install failed: %v\nOutput: %s", err, output)
@@ -80,9 +88,17 @@ func TestInstallBeadsHasCorrectPrefix(t *testing.T) {
 	// Build gt binary for testing
 	gtBinary := buildGT(t)
 
+	// HOME is overridden for isolation; configure git identity so EnsureDoltIdentity works.
+	env := append(os.Environ(), "HOME="+tmpDir)
+	configureGitIdentity(t, env)
+
+	// Kill any stale dolt from a previous test to avoid port 3307 conflict.
+	_ = exec.Command("pkill", "-f", "dolt sql-server").Run()
+	t.Cleanup(func() { _ = exec.Command("pkill", "-f", "dolt sql-server").Run() })
+
 	// Run gt install (includes beads init by default)
 	cmd := exec.Command(gtBinary, "install", hqPath)
-	cmd.Env = append(os.Environ(), "HOME="+tmpDir)
+	cmd.Env = env
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("gt install failed: %v\nOutput: %s", err, output)
@@ -92,25 +108,75 @@ func TestInstallBeadsHasCorrectPrefix(t *testing.T) {
 	beadsDir := filepath.Join(hqPath, ".beads")
 	assertDirExists(t, beadsDir, ".beads/")
 
-	// Verify beads database was initialized (both metadata.json and dolt/ exist with dolt backend)
+	// Verify beads database was initialized: metadata.json present and dolt server
+	// data directory exists. Since bd v0.52.0 server mode, dolt data lives in
+	// .dolt-data/hq/ (centralized) rather than the legacy .beads/dolt/ path.
 	metadataPath := filepath.Join(beadsDir, "metadata.json")
 	assertFileExists(t, metadataPath, ".beads/metadata.json")
-	doltDir := filepath.Join(beadsDir, "dolt")
-	assertDirExists(t, doltDir, ".beads/dolt/")
+	doltDataDir := filepath.Join(hqPath, ".dolt-data", "hq")
+	assertDirExists(t, doltDataDir, ".dolt-data/hq/")
 
-	// Verify prefix by running bd config get issue_prefix
-	bdCmd := exec.Command("bd", "config", "get", "issue_prefix")
-	bdCmd.Dir = hqPath
-	prefixOutput, err := bdCmd.Output() // Use Output() to get only stdout
+	// Verify metadata points to canonical HQ Dolt database, not beads_hq.
+	var metadata struct {
+		DoltMode     string `json:"dolt_mode"`
+		DoltDatabase string `json:"dolt_database"`
+	}
+	metadataBytes, err := os.ReadFile(metadataPath)
 	if err != nil {
-		// If Output() fails, try CombinedOutput for better error info
-		combinedOut, _ := exec.Command("bd", "config", "get", "issue_prefix").CombinedOutput()
-		t.Fatalf("bd config get issue_prefix failed: %v\nOutput: %s", err, combinedOut)
+		t.Fatalf("reading metadata.json: %v", err)
+	}
+	if err := json.Unmarshal(metadataBytes, &metadata); err != nil {
+		t.Fatalf("parsing metadata.json: %v", err)
+	}
+	if metadata.DoltMode != "server" {
+		t.Errorf("metadata dolt_mode = %q, want %q", metadata.DoltMode, "server")
+	}
+	if metadata.DoltDatabase != "hq" {
+		t.Errorf("metadata dolt_database = %q, want %q", metadata.DoltDatabase, "hq")
 	}
 
-	prefix := strings.TrimSpace(string(prefixOutput))
-	if prefix != "hq" {
-		t.Errorf("beads issue_prefix = %q, want %q", prefix, "hq")
+	// Verify top-level config.yaml exists with hq prefix keys.
+	configPath := filepath.Join(beadsDir, "config.yaml")
+	assertFileExists(t, configPath, ".beads/config.yaml")
+	configBytes, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("reading config.yaml: %v", err)
+	}
+	configText := string(configBytes)
+	if !strings.Contains(configText, "prefix: hq") {
+		t.Errorf("config.yaml missing prefix: hq, got:\n%s", configText)
+	}
+	if !strings.Contains(configText, "issue-prefix: hq") {
+		t.Errorf("config.yaml missing issue-prefix: hq, got:\n%s", configText)
+	}
+	if !strings.Contains(configText, "sync.mode: dolt-native") {
+		t.Errorf("config.yaml missing sync.mode: dolt-native, got:\n%s", configText)
+	}
+
+	// Optional online smoke check: verify prefix via bd CLI when Dolt is reachable.
+	// Core assertions already validate prefix from tracked config.yaml above.
+	bdCmd := exec.Command("bd", "config", "get", "issue_prefix")
+	bdCmd.Dir = hqPath
+	bdCmd.Env = append(env, "BEADS_DIR="+beadsDir)
+	prefixOutput, err := bdCmd.Output() // stdout only
+	if err != nil {
+		// In CI/e2e, transient Dolt connection races can make this online check flaky.
+		// Keep test deterministic by relying on config.yaml assertions when bd is offline.
+		debugCmd := exec.Command("bd", "config", "get", "issue_prefix")
+		debugCmd.Dir = hqPath
+		debugCmd.Env = append(env, "BEADS_DIR="+beadsDir)
+		combinedOut, _ := debugCmd.CombinedOutput()
+		out := string(combinedOut)
+		if strings.Contains(out, "Dolt server still unreachable") || strings.Contains(out, "connect: connection refused") {
+			t.Logf("bd online prefix check skipped due transient Dolt unreachability: %s", strings.TrimSpace(out))
+		} else {
+			t.Fatalf("bd config get issue_prefix failed: %v\nOutput: %s", err, combinedOut)
+		}
+	} else {
+		prefix := strings.TrimSpace(string(prefixOutput))
+		if prefix != "hq" {
+			t.Errorf("beads issue_prefix = %q, want %q", prefix, "hq")
+		}
 	}
 }
 
@@ -148,6 +214,140 @@ func TestInstallIdempotent(t *testing.T) {
 	}
 }
 
+// TestInstallForcePreservesConfigs validates that re-running gt install --force
+// preserves existing town.json and rigs.json rather than clobbering them.
+func TestInstallForcePreservesConfigs(t *testing.T) {
+	tmpDir := t.TempDir()
+	hqPath := filepath.Join(tmpDir, "test-hq")
+
+	gtBinary := buildGT(t)
+
+	// First install
+	cmd := exec.Command(gtBinary, "install", hqPath, "--no-beads")
+	cmd.Env = append(os.Environ(), "HOME="+tmpDir)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("first install failed: %v\nOutput: %s", err, output)
+	}
+
+	// Inject sentinel values into town.json and rigs.json
+	mayorDir := filepath.Join(hqPath, "mayor")
+	townPath := filepath.Join(mayorDir, "town.json")
+	rigsPath := filepath.Join(mayorDir, "rigs.json")
+
+	townData, err := os.ReadFile(townPath)
+	if err != nil {
+		t.Fatalf("reading town.json: %v", err)
+	}
+	var townConfig config.TownConfig
+	if err := json.Unmarshal(townData, &townConfig); err != nil {
+		t.Fatalf("parsing town.json: %v", err)
+	}
+	// Set a sentinel public name to detect clobbering
+	townConfig.PublicName = "sentinel-preserve-test"
+	sentinelTown, err := json.MarshalIndent(townConfig, "", "  ")
+	if err != nil {
+		t.Fatalf("marshaling town.json: %v", err)
+	}
+	if err := os.WriteFile(townPath, sentinelTown, 0644); err != nil {
+		t.Fatalf("writing sentinel town.json: %v", err)
+	}
+
+	// Add a sentinel rig entry
+	rigsData, err := os.ReadFile(rigsPath)
+	if err != nil {
+		t.Fatalf("reading rigs.json: %v", err)
+	}
+	var rigsConfig config.RigsConfig
+	if err := json.Unmarshal(rigsData, &rigsConfig); err != nil {
+		t.Fatalf("parsing rigs.json: %v", err)
+	}
+	rigsConfig.Rigs["sentinel-rig"] = config.RigEntry{GitURL: "https://example.com/sentinel"}
+	sentinelRigs, err := json.MarshalIndent(rigsConfig, "", "  ")
+	if err != nil {
+		t.Fatalf("marshaling rigs.json: %v", err)
+	}
+	if err := os.WriteFile(rigsPath, sentinelRigs, 0644); err != nil {
+		t.Fatalf("writing sentinel rigs.json: %v", err)
+	}
+
+	// Re-install with --force
+	cmd = exec.Command(gtBinary, "install", hqPath, "--no-beads", "--force")
+	cmd.Env = append(os.Environ(), "HOME="+tmpDir)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("install --force failed: %v\nOutput: %s", err, output)
+	}
+
+	// Verify preserve messages
+	outStr := string(output)
+	if !strings.Contains(outStr, "already exists, preserving") {
+		t.Errorf("expected 'already exists, preserving' message, got:\n%s", outStr)
+	}
+
+	// Verify town.json sentinel survived
+	townAfter, err := os.ReadFile(townPath)
+	if err != nil {
+		t.Fatalf("reading town.json after re-install: %v", err)
+	}
+	var townAfterConfig config.TownConfig
+	if err := json.Unmarshal(townAfter, &townAfterConfig); err != nil {
+		t.Fatalf("parsing town.json after re-install: %v", err)
+	}
+	if townAfterConfig.PublicName != "sentinel-preserve-test" {
+		t.Errorf("town.json was clobbered: PublicName = %q, want %q", townAfterConfig.PublicName, "sentinel-preserve-test")
+	}
+
+	// Verify rigs.json sentinel survived
+	rigsAfter, err := os.ReadFile(rigsPath)
+	if err != nil {
+		t.Fatalf("reading rigs.json after re-install: %v", err)
+	}
+	var rigsAfterConfig config.RigsConfig
+	if err := json.Unmarshal(rigsAfter, &rigsAfterConfig); err != nil {
+		t.Fatalf("parsing rigs.json after re-install: %v", err)
+	}
+	if _, ok := rigsAfterConfig.Rigs["sentinel-rig"]; !ok {
+		t.Errorf("rigs.json was clobbered: sentinel-rig entry missing")
+	}
+}
+
+// TestInstallForceRejectsNonRegularConfigs validates that gt install --force
+// errors when town.json or rigs.json exists as a directory instead of a file.
+func TestInstallForceRejectsNonRegularConfigs(t *testing.T) {
+	tmpDir := t.TempDir()
+	hqPath := filepath.Join(tmpDir, "test-hq")
+
+	gtBinary := buildGT(t)
+
+	// First install
+	cmd := exec.Command(gtBinary, "install", hqPath, "--no-beads")
+	cmd.Env = append(os.Environ(), "HOME="+tmpDir)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("first install failed: %v\nOutput: %s", err, output)
+	}
+
+	// Replace town.json with a directory
+	mayorDir := filepath.Join(hqPath, "mayor")
+	townPath := filepath.Join(mayorDir, "town.json")
+	if err := os.Remove(townPath); err != nil {
+		t.Fatalf("removing town.json: %v", err)
+	}
+	if err := os.Mkdir(townPath, 0755); err != nil {
+		t.Fatalf("creating town.json as directory: %v", err)
+	}
+
+	// Re-install with --force should fail
+	cmd = exec.Command(gtBinary, "install", hqPath, "--no-beads", "--force")
+	cmd.Env = append(os.Environ(), "HOME="+tmpDir)
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("install --force should have failed with directory town.json, output:\n%s", output)
+	}
+	if !strings.Contains(string(output), "not a regular file") {
+		t.Errorf("expected 'not a regular file' error, got:\n%s", output)
+	}
+}
+
 // TestInstallFormulasProvisioned validates that embedded formulas are copied
 // to .beads/formulas/ during installation.
 func TestInstallFormulasProvisioned(t *testing.T) {
@@ -156,9 +356,17 @@ func TestInstallFormulasProvisioned(t *testing.T) {
 
 	gtBinary := buildGT(t)
 
+	// HOME is overridden for isolation; configure git identity so EnsureDoltIdentity works.
+	env := append(os.Environ(), "HOME="+tmpDir)
+	configureGitIdentity(t, env)
+
+	// Kill any stale dolt from a previous test to avoid port 3307 conflict.
+	_ = exec.Command("pkill", "-f", "dolt sql-server").Run()
+	t.Cleanup(func() { _ = exec.Command("pkill", "-f", "dolt sql-server").Run() })
+
 	// Run gt install (includes beads and formula provisioning)
 	cmd := exec.Command(gtBinary, "install", hqPath)
-	cmd.Env = append(os.Environ(), "HOME="+tmpDir)
+	cmd.Env = env
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("gt install failed: %v\nOutput: %s", err, output)
@@ -563,14 +771,16 @@ func TestInstallWithDaemon(t *testing.T) {
 	})
 }
 
-// cleanE2EEnv returns os.Environ() with all GT_* variables removed.
-// This ensures tests don't inherit stale role environment from CI or previous tests.
+// cleanE2EEnv returns os.Environ() with GT_* variables removed, except
+// GT_DOLT_PORT which is preserved so subprocesses connect to the ephemeral
+// Dolt test server started by TestMain instead of defaulting to port 3307.
 func cleanE2EEnv() []string {
 	var clean []string
 	for _, env := range os.Environ() {
-		if !strings.HasPrefix(env, "GT_") {
-			clean = append(clean, env)
+		if strings.HasPrefix(env, "GT_") && !strings.HasPrefix(env, "GT_DOLT_PORT=") {
+			continue
 		}
+		clean = append(clean, env)
 	}
 	return clean
 }

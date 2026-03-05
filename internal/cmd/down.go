@@ -45,7 +45,7 @@ Shutdown levels (progressively more aggressive):
   gt down                    Stop infrastructure (default)
   gt down --polecats         Also stop all polecat sessions
   gt down --all              Full shutdown with orphan cleanup
-  gt down --nuke             Also kill the tmux server (DESTRUCTIVE)
+  gt down --nuke             Also kill the shared tmux server
 
 Infrastructure agents stopped:
   • Refineries - Per-rig work processors
@@ -80,7 +80,7 @@ func init() {
 	downCmd.Flags().BoolVarP(&downForce, "force", "f", false, "Force kill without graceful shutdown")
 	downCmd.Flags().BoolVarP(&downPolecats, "polecats", "p", false, "Also stop all polecat sessions")
 	downCmd.Flags().BoolVarP(&downAll, "all", "a", false, "Full shutdown with orphan cleanup and verification")
-	downCmd.Flags().BoolVar(&downNuke, "nuke", false, "Kill entire tmux server (DESTRUCTIVE - kills non-GT sessions!)")
+	downCmd.Flags().BoolVar(&downNuke, "nuke", false, "Kill the shared tmux server (default socket) and all its sessions")
 	downCmd.Flags().BoolVar(&downDryRun, "dry-run", false, "Preview what would be stopped without taking action")
 	rootCmd.AddCommand(downCmd)
 }
@@ -152,7 +152,7 @@ func runDown(cmd *cobra.Command, args []string) error {
 
 	// Phase 1: Stop refineries
 	for _, rigName := range rigs {
-		sessionName := fmt.Sprintf("gt-%s-refinery", rigName)
+		sessionName := session.RefinerySessionName(session.PrefixFor(rigName))
 		if downDryRun {
 			if running, _ := t.HasSession(sessionName); running {
 				printDownStatus(fmt.Sprintf("Refinery (%s)", rigName), true, "would stop")
@@ -172,7 +172,7 @@ func runDown(cmd *cobra.Command, args []string) error {
 
 	// Phase 2: Stop witnesses
 	for _, rigName := range rigs {
-		sessionName := fmt.Sprintf("gt-%s-witness", rigName)
+		sessionName := session.WitnessSessionName(session.PrefixFor(rigName))
 		if downDryRun {
 			if running, _ := t.HasSession(sessionName); running {
 				printDownStatus(fmt.Sprintf("Witness (%s)", rigName), true, "would stop")
@@ -223,8 +223,10 @@ func runDown(cmd *cobra.Command, args []string) error {
 			if err := daemon.StopDaemon(townRoot); err != nil {
 				printDownStatus("Daemon", false, err.Error())
 				allOK = false
-			} else {
+			} else if pid > 0 {
 				printDownStatus("Daemon", true, fmt.Sprintf("stopped (was PID %d)", pid))
+			} else {
+				printDownStatus("Daemon", true, "stopped (stale lock cleaned)")
 			}
 		} else {
 			printDownStatus("Daemon", true, "not running")
@@ -290,16 +292,23 @@ func runDown(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Phase 6: Nuke tmux server (--nuke only, DESTRUCTIVE)
+	// Phase 6: Nuke tmux server (--nuke only)
+	// All towns share the "default" tmux socket (see registry.go InitRegistry),
+	// so --nuke kills the shared server and all sessions on it. Users may also
+	// have opened custom windows/panes, so we require confirmation.
 	if downNuke {
+		socket := tmux.GetDefaultSocket()
+		socketLabel := "default"
+		if socket != "" {
+			socketLabel = socket
+		}
 		if downDryRun {
-			printDownStatus("Tmux server", true, "would kill (DESTRUCTIVE)")
+			printDownStatus("Tmux server", true, fmt.Sprintf("would kill (socket: %s)", socketLabel))
 		} else if os.Getenv("GT_NUKE_ACKNOWLEDGED") == "" {
-			// Require explicit acknowledgement for destructive operation
 			fmt.Println()
-			fmt.Printf("%s The --nuke flag kills ALL tmux sessions, not just Gas Town.\n",
-				style.Bold.Render("⚠ BLOCKED:"))
-			fmt.Printf("This includes vim sessions, running builds, SSH connections, etc.\n")
+			fmt.Printf("%s The --nuke flag kills the shared tmux server (socket: %s).\n",
+				style.Bold.Render("⚠ BLOCKED:"), socketLabel)
+			fmt.Printf("All towns share this socket — this will destroy all tmux sessions, including any custom windows you opened.\n")
 			fmt.Println()
 			fmt.Printf("To proceed, run with: %s\n", style.Bold.Render("GT_NUKE_ACKNOWLEDGED=1 gt down --nuke"))
 			allOK = false
@@ -308,7 +317,7 @@ func runDown(cmd *cobra.Command, args []string) error {
 				printDownStatus("Tmux server", false, err.Error())
 				allOK = false
 			} else {
-				printDownStatus("Tmux server", true, "killed (all tmux sessions destroyed)")
+				printDownStatus("Tmux server", true, fmt.Sprintf("killed (socket: %s)", socketLabel))
 			}
 		}
 	}
@@ -459,7 +468,7 @@ func verifyShutdown(t *tmux.Tmux, townRoot string) []string {
 	sessions, err := t.ListSessions()
 	if err == nil {
 		for _, sess := range sessions {
-			if strings.HasPrefix(sess, "gt-") || strings.HasPrefix(sess, "hq-") {
+			if session.IsKnownSession(sess) {
 				respawned = append(respawned, fmt.Sprintf("tmux session %s", sess))
 			}
 		}
